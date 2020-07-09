@@ -23,7 +23,6 @@ import com.connexta.replication.data.MetadataAttribute;
 import com.connexta.replication.data.MetadataImpl;
 import com.connexta.replication.data.ResourceImpl;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.sakserv.minicluster.impl.HdfsLocalCluster;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -41,7 +40,6 @@ import java.util.List;
 import java.util.Map;
 import javax.ws.rs.core.MediaType;
 import org.apache.commons.io.IOUtils;
-import org.apache.hadoop.conf.Configuration;
 import org.apache.http.client.ResponseHandler;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpRequestBase;
@@ -56,65 +54,72 @@ import org.codice.ditto.replication.api.data.UpdateStorageRequest;
 import org.codice.ditto.replication.api.impl.data.CreateStorageRequestImpl;
 import org.codice.ditto.replication.api.impl.data.ResourceRequestImpl;
 import org.codice.ditto.replication.api.impl.data.UpdateStorageRequestImpl;
-import org.junit.After;
-import org.junit.Before;
+import org.junit.AfterClass;
 import org.junit.BeforeClass;
+import org.junit.ClassRule;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.testcontainers.containers.FixedHostPortGenericContainer;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
 
 public class WebHdfsClientTest {
-  private static final String HDFS_PATH = "/webhdfs/v1";
-  private static final String HDFS_PORT = "12341";
-  private static final String BASE_URL = "http://localhost:" + HDFS_PORT + HDFS_PATH;
   private static final String TEST_DATA_STRING =
       "Grumpy wizards make toxic brew for the evil queen and jack.";
   private static final Logger LOGGER = LoggerFactory.getLogger(WebHdfsClientTest.class);
   private static final WebHdfsNodeAdapterFactory adapterFactory = new WebHdfsNodeAdapterFactory();
-  private static HdfsLocalCluster hdfsLocalCluster;
-  private WebHdfsNodeAdapter adapter;
+  private static WebHdfsNodeAdapter adapter;
+
+  private static final String IMAGE_NAME = "hadoop-docker:3.2.1";
+  private static final String WEBHDFS_PATH = "/webhdfs/v1";
+  private static final int HDFS_NAMENODE_PORT = 9870;
+  private static final int HDFS_DATANODE_PORT = 9864;
+
+  private static String containerHost;
+  private static int containerPort;
+  private static String webhdfsUrl;
+
+  @ClassRule
+  // Note: The exposed and mapped port have to match for these tests to work.
+  public static GenericContainer hadoopContainer =
+      new FixedHostPortGenericContainer<>(IMAGE_NAME)
+          .withCreateContainerCmdModifier(cmd -> cmd.withHostName("localhost"))
+          .withFixedExposedPort(HDFS_NAMENODE_PORT, HDFS_NAMENODE_PORT)
+          .withFixedExposedPort(HDFS_DATANODE_PORT, HDFS_DATANODE_PORT)
+          .waitingFor(Wait.forHealthcheck());
 
   @BeforeClass
-  public static void setUpClass() {
-    hdfsLocalCluster =
-        new HdfsLocalCluster.Builder()
-            .setHdfsNamenodePort(12345)
-            .setHdfsNamenodeHttpPort(Integer.parseInt(HDFS_PORT))
-            .setHdfsTempDir("embedded_hdfs")
-            .setHdfsNumDatanodes(1)
-            .setHdfsEnablePermissions(false)
-            .setHdfsFormat(true)
-            .setHdfsEnableRunningUserAsProxyUser(true)
-            .setHdfsConfig(new Configuration())
-            .build();
+  public static void setupClass() throws MalformedURLException, InterruptedException {
+    // wait for the datanode to fully start and be available
+    Thread.sleep(60000);
+
+    containerHost = hadoopContainer.getHost();
+    containerPort = hadoopContainer.getMappedPort(HDFS_NAMENODE_PORT);
+
+    webhdfsUrl = String.format("http://%s:%d%s", containerHost, containerPort, WEBHDFS_PATH);
+    LOGGER.info("HDFS instance started and is available at " + webhdfsUrl);
+
+    adapter = (WebHdfsNodeAdapter) adapterFactory.create(new URL(webhdfsUrl));
   }
 
-  @Before
-  public void setupTest() throws Exception {
-    adapter = (WebHdfsNodeAdapter) adapterFactory.create(new URL(BASE_URL));
-
-    LOGGER.info("HDFS instance starting up!");
-    hdfsLocalCluster.start();
-  }
-
-  @After
-  public void tearDownTest() throws Exception {
-    LOGGER.info("HDFS instance shutting down!");
-    hdfsLocalCluster.stop();
-
+  @AfterClass
+  public static void tearDownClass() throws IOException {
     adapter.close();
   }
 
-  @Test(expected = ReplicationException.class)
-  public void testInvalidUrlIsNotAvailable() throws MalformedURLException {
-    adapter = (WebHdfsNodeAdapter) adapterFactory.create(new URL("http://foobar:9999"));
-    adapter.isAvailable();
+  @Test
+  public void testNamenodeContainerConnection() {
+    assertThat(containerHost, is("localhost"));
+    assertThat(containerPort, is(HDFS_NAMENODE_PORT));
+    assertThat(adapter.isAvailable(), is(true));
   }
 
   @Test(expected = ReplicationException.class)
-  public void testStoppedClusterIsNotAvailable() throws Exception {
-    hdfsLocalCluster.stop();
-    adapter.isAvailable();
+  public void testInvalidUrlIsNotAvailable() throws IOException {
+    WebHdfsNodeAdapter badAdapter = (WebHdfsNodeAdapter) adapterFactory.create(new URL("http://foobar:9999"));
+    badAdapter.isAvailable();
+    badAdapter.close();
   }
 
   @Test
@@ -122,7 +127,7 @@ public class WebHdfsClientTest {
     String testId = "order-66-clones-memo";
     Date testDate = new Date();
     String testName = formatResourceName(testId, testDate);
-    String url = String.format("%s/%s.txt", BASE_URL, testName);
+    String url = String.format("%s/%s.txt", webhdfsUrl, testName);
 
     // creates the resource in the HDFS instance to be read and verifies the resource exists
     CreateStorageRequest createStorageRequest =
@@ -147,7 +152,7 @@ public class WebHdfsClientTest {
     String testName = "404-not-found";
     Date testDate = new Date();
     String filename = formatResourceName(testId, testDate) + ".txt";
-    String badHostnameUri = String.format("http://foobar:%s/webhdfs/v1/%s", HDFS_PORT, filename);
+    String badHostnameUri = String.format("http://foobar:%s/webhdfs/v1/%s", containerPort, filename);
 
     // creates the resource with the bad hostname
     CreateStorageRequest createStorageRequest =
@@ -189,7 +194,7 @@ public class WebHdfsClientTest {
     String testName = "404-not-found";
     Date testDate = new Date();
     String filename = formatResourceName(testId, testDate) + ".txt";
-    String url = String.format("%s/%s", BASE_URL, filename);
+    String url = String.format("%s/%s", webhdfsUrl, filename);
 
     // creates the resource but doesn't write it to HDFS
     CreateStorageRequest createStorageRequest =
@@ -211,9 +216,13 @@ public class WebHdfsClientTest {
     String filename = formatResourceName(testId, testDate) + ".txt";
     CreateStorageRequest createStorageRequest =
         generateTestStorageRequest(testId, testName, testDate);
+    boolean created = adapter.createResource(createStorageRequest);
 
-    adapter.createResource(createStorageRequest);
-    verifyFileExists(filename);
+    if (created) {
+      verifyFileExists(filename);
+    }
+
+    assertThat(created, is(true));
   }
 
   @Test
@@ -397,7 +406,7 @@ public class WebHdfsClientTest {
    * @throws URISyntaxException If the URL string does not have valid syntax
    */
   private void verifyFileExists(String filename) throws URISyntaxException {
-    String url = String.format("%s/%s", BASE_URL, filename);
+    String url = String.format("%s/%s", webhdfsUrl, filename);
     URIBuilder builder = new URIBuilder(url);
     builder.addParameter("op", "GETFILESTATUS");
     URI uri = builder.build();
@@ -409,12 +418,11 @@ public class WebHdfsClientTest {
       fileStatus = (Map) responseContent.get("FileStatus");
     }
 
-    assertThat(hdfsLocalCluster.getHdfsFormat(), is(true));
     assertThat(
         uri.toString(),
         is(
             String.format(
-                "http://localhost:%s/webhdfs/v1/%s?op=GETFILESTATUS", HDFS_PORT, filename)));
+                "http://localhost:%s/webhdfs/v1/%s?op=GETFILESTATUS", containerPort, filename)));
     assertThat(fileStatus, notNullValue());
     assertThat(fileStatus.get("type"), is("FILE"));
   }

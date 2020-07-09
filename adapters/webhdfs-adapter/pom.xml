@@ -33,6 +33,7 @@
         <guava.version>20.0</guava.version>
         <hadoop.version>2.7.3</hadoop.version>
         <hadoop.mini.clusters.version>0.1.16</hadoop.mini.clusters.version>
+        <testcontainers.version>1.14.3</testcontainers.version>
     </properties>
 
     <dependencies>
@@ -117,6 +118,12 @@
             <groupId>replication-adapters</groupId>
             <artifactId>ddf-adapter</artifactId>
             <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
